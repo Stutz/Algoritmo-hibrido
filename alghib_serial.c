@@ -8,6 +8,7 @@
   #include <math.h>
   #include <time.h>
   #include <sys/timeb.h>
+  #include "mpi.h"
 
 
 /*** Macros ***/
@@ -16,9 +17,9 @@
     #define strcmpi(a,b)      strcasecmp((a),(b))
     #define strncmpi(a,b,c)   strncasecmp((a),(b),(c))
   #endif
-
+  
   #define root 0
-
+  
   enum VERBOSE {NO_VERB=0, CHKPOINT=0x01, RESULTS=0x02, PARMS=0x04, WARM=0x08, ERRS=0x10, PARMSG=0x20, ALL=0xFF};
   enum SEND_TAG {HTag, SxTag, SfxTag};
 
@@ -41,6 +42,8 @@ typedef struct timeb timeb_t;
     float (*fObj)(float *); // Ponteiro para a função objetivo
   } funcao;
 
+  int    my_rank,         // Numero de rank do processo
+         np;              // Numero de processos
 
 /*** Prototipos ***/
   void classify(int *H, float *Sfx, float *Sx, int *nh, int ns, float tol_same);
@@ -56,7 +59,7 @@ typedef struct timeb timeb_t;
   float f6(float *);
   void Start(unsigned int);
   void Finnish(void);
-  void abortexec(char *msg, int ret);
+  void abortexecMPI(int rank, char *msg, int ret);
   float getMarks(const timeb_t t0, timeb_t *t1);
   double fdifftime(const timeb_t, const timeb_t);
 
@@ -98,53 +101,69 @@ int main(int argc, char *argv[]){
   timeb_t t0,       // Hora inicial
           t1;       // Hora atual
 
-
-
+  
+  
+  /* MPI  */
+  MPI_Request req;        // Identificador de requisicao
+  MPI_Status statusReq;   // Status de comunicacao MPI
+  
 
   /* Processo-global */
   bool ImRoot=0;          // Indica se a unidade de processamento e´ o root
   char   msg[100]="";     // Mensagem
   int *nhBuf=NULL;
-
-
+  
+  /* Processo-Local */
+  //
+  
   /**************************************************
   //// Procedimentos iniciais
   **************************************************/
   /* Incializa hora inicial */
   ftime(&t0);
-
+  
 
   /**************************************************
-  //// Inicializacao
+  //// Inicializacao do MPI
   ***************************************************/
-  if (verbose&(CHKPOINT+PARMSG)){ printf("- Inicializando ...\n"); }
+  if (verbose&(CHKPOINT+PARMSG)){ printf("[%d]- Inicializando MPI ...\n", my_rank); }
+  MPI_Init(&argc, &argv);
 
+  /* Acha o rank do processador */
+  MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 
+  /* Acha o numero total de processadores */
+  MPI_Comm_size(MPI_COMM_WORLD, &np);
+  
+  /* Atualiza o flag de "Eu sou o root!" */
+  ImRoot = (my_rank==root);
+
+  
   /**************************************************
   //// Verificacao de argumentos
   ***************************************************/
   // Pega argumentos da linha de comandos (se houver!)
   for(i=1; i<argc; i++){
-
+  
     // Help
     if(strcmpi(argv[i], "-h")==0){
       if (ImRoot) Help(argv[0]);
-      abortexec("", 0);
+      abortexecMPI(my_rank, "", 0);
       return 0;
-
+    
     // Contabiliza tempos de execucao
     }else if(strcmpi(argv[i], "-t")==0){
      timer=true;
-
+     
     // Verbose
     }else if(strcmpi(argv[i], "-v")==0){
       // Verbose //
       verbose=ALL;
-
+      
     // Verbose especifico
     }else if(strncmpi(argv[i], "-v", 2)==0){
       verbose = (enum VERBOSE) atoi(argv[i]+2);
-
+      
     // Function number select
     }else if(strncmpi(argv[i], "-fn", 3)==0){
       fn = atoi(argv[i]+3);
@@ -152,7 +171,7 @@ int main(int argc, char *argv[]){
         mprintf("Argumento [%s] invalido:\n", argv[i]);
         exit(0);
       }
-
+      
     // Número de avaliações por nó
     }else if(strncmpi(argv[i], "-na", 3)==0){
       n_aval = atoi(argv[i]+3);
@@ -165,21 +184,21 @@ int main(int argc, char *argv[]){
     }else{
       strcpy(msg, "Argumento invalido: ");
       strcat(msg, argv[i]);
-      abortexec(msg, 1);
+      abortexecMPI(my_rank, msg, 1);
       mprintf("Argumento [%s] invalido:\n", argv[i]);
       exit(0);
     }
   }
 
-
+  
   /**************************************************
   //// Inicialização de variáveis
   ***************************************************/
   // Calculo do número total de avaliações
-  total_aval = n_aval;
-
+  total_aval = n_aval*np;
+  
   // Número máximo de soluções do root é o número total de soluções máximo obtido por todos os nós
-  n_maxsolutions = total_aval;
+  n_maxsolutions = (ImRoot) ?total_aval :n_aval;
 
   // Executa os procedimentos iniciais para a função-ojetivo especificada
   Start(fn);
@@ -236,10 +255,12 @@ int main(int argc, char *argv[]){
     exit(0);
   }
 
-  nhBuf = (int *) malloc(sizeof(int));
-  if (nhBuf==NULL) {
-    printf("Erro de alocacao de memoria-distancias\n");
-    exit(0);
+  if (ImRoot){
+    nhBuf = (int *) malloc(sizeof(int)*np);
+    if (nhBuf==NULL) {
+      printf("Erro de alocacao de memoria-distancias\n");
+      exit(0);
+    }
   }
 
 
@@ -249,10 +270,10 @@ int main(int argc, char *argv[]){
   // Inicialização de variáveis
   randomize();
   nh = 0;  // Inicialização do contador de classes
-
+  
   // Inicia a contagem do histograma
   for(l=0; l<n_maxsolutions; l++) {
-    H[l] = 1;
+    H[l] = 1; 
   }
 
   // Loop principal do algoritmo híbrido
@@ -359,7 +380,7 @@ int main(int argc, char *argv[]){
       }
     } // Fim HJ
 
-
+    
     /**************************************************
     //// Verifica se a solução é aceita
     ***************************************************/
@@ -367,8 +388,8 @@ int main(int argc, char *argv[]){
     if (fx_best > tol_accept) {
       continue;
     }
-
-
+    
+    
     /**************************************************
     //// Salva a solução nos vetores de soluções S e R
     ***************************************************/
@@ -377,9 +398,9 @@ int main(int argc, char *argv[]){
       Sx[nh*funcao.nvars+k] = funcao.val[k];
     }
 
-
+    
     /**************************************************
-    //// Classifica e contabiliza a solução
+    //// Classifica e contabiliza a solução dentro do próprio nó
     ***************************************************/
     classify(H, Sfx, Sx, &nh, 1, tol_same);
 
@@ -387,36 +408,79 @@ int main(int argc, char *argv[]){
 
 
   /**************************************************
+  //// Junta as soluções obtidas pelos outros nós
+  ***************************************************/
+
+  // Recupera o número de classes obtidas em cada nó
+  MPI_Gather(&nh, 1, MPI_INT, nhBuf, 1, MPI_INT, root, MPI_COMM_WORLD);
+  
+  if (ImRoot) {
+    int dh=0; // Deslocamento
+    
+    printf("\n\n================\n");
+    for(l=0; l<np; l++){
+      if (l!=my_rank){
+        MPI_Recv(H+dh,   sizeof(int)*nhBuf[l],   MPI_INT,   l, HTag,   MPI_COMM_WORLD, &statusReq);
+        MPI_Recv(Sfx+dh, sizeof(float)*nhBuf[l], MPI_FLOAT, l, SfxTag, MPI_COMM_WORLD, &statusReq);
+        MPI_Recv(Sx+(dh*funcao.nvars),  sizeof(float)*nhBuf[l], MPI_FLOAT, l, SxTag,  MPI_COMM_WORLD, &statusReq);
+      }
+
+      printf("%d ==>\n", l);
+      for(i=dh; i<(dh+nhBuf[l]); i++) {
+        printf("  [%d] (%d) ", i+1, H[i]);
+        for(k=0; k<funcao.nvars; k++){
+          printf("%g ", Sx[i*funcao.nvars+k]);
+        }
+        printf("%g \n", Sfx[i]);
+      }
+      
+      dh += nhBuf[l];
+    }
+
+    classify(H, Sfx, Sx, &nh, (dh-nh), tol_same);
+
+  }else{
+    MPI_Isend(H,   sizeof(int)*nh,   MPI_INT,   root, HTag,   MPI_COMM_WORLD, &req);
+    MPI_Isend(Sfx, sizeof(float)*nh, MPI_FLOAT, root, SfxTag, MPI_COMM_WORLD, &req);
+    MPI_Isend(Sx,  sizeof(float)*nh, MPI_FLOAT, root, SxTag,  MPI_COMM_WORLD, &req);
+  }
+  
+  
+  /**************************************************
   //// Imprime o conjunto de soluções
   ***************************************************/
-  int aceitos=0;
-
-  printf("\n\n");
-  for(l=0; l<nh; l++) {
-    aceitos += H[l];
-
-    printf("[%d] (%d) ", l+1, H[l]);
-    for(k=0; k<funcao.nvars; k++){
-      printf("%g ", Sx[l*funcao.nvars+k]);
+  if (ImRoot) {
+    int aceitos=0;
+    
+    printf("\n\n");
+    for(l=0; l<nh; l++) {
+      aceitos += H[l];
+      
+      printf("[%d] (%d) ", l+1, H[l]);
+      for(k=0; k<funcao.nvars; k++){
+        printf("%g ", Sx[l*funcao.nvars+k]);
+      }
+      printf("%g \n", Sfx[l]);
     }
-    printf("%g \n", Sfx[l]);
-  }
 
-  printf("\nAceitos: %d\n", aceitos);
-  printf("Classes: %d\n", nh);
-  printf("Rejeitados: %d\n\n", total_aval-aceitos);
+    printf("\nAceitos: %d\n", aceitos);
+    printf("Classes: %d\n", nh);
+    printf("Rejeitados: %d\n\n", total_aval-aceitos);
+  }
 
 
   /**************************************************
   //// Encerramento
   ***************************************************/
+  if (ImRoot) {
+  }
 
 
   /**************************************************
   //// Finalizacoes
   ***************************************************/
   /* Libera espacos de memoria reservados */
-  if (verbose&CHKPOINT){ printf("- Liberando alocacoes de memoria...\n"); }
+  if (verbose&CHKPOINT){ printf("[%d]- Liberando alocacoes de memoria...\n", my_rank); }
   free(x);
   free(r);
   free(yi);
@@ -429,12 +493,13 @@ int main(int argc, char *argv[]){
 
   Finnish();
 
-  /* Finalizando */
-  if (verbose&(CHKPOINT+PARMSG)){ printf("- Finalizando ...\n"); }
+  /* Finalizando o MPI */
+  if (verbose&(CHKPOINT+PARMSG)){ printf("[%d]- Finalizando MPI ...\n", my_rank); }
+  MPI_Finalize();
 
   /* Fim do programa */
-  if (verbose&(CHKPOINT+WARM)){ printf("- TERMINO DO PROGRAMA ...\n"); }
-  if (timer){ printf("- Tempo transcorrido= %f\n", getMarks(t0, &t1)); }
+  if (verbose&(CHKPOINT+WARM)){ printf("[%d]- TERMINO DO PROGRAMA ...\n", my_rank); }
+  if (timer){ printf("[%d]- Tempo transcorrido= %f\n", my_rank, getMarks(t0, &t1)); }
 
   return 0;
 }
@@ -466,7 +531,7 @@ void classify(int *H, float *Sfx, float *Sx, int *nh, int ns, float tol_same){
 
     for(i=0; i<(*nh); i++){
       same = true; // Admite-se que o conjunto de variáveis é o mesmo
-
+      
       for(k=0; k<funcao.nvars; k++){
         // Cálcula a diferença entre os argumentos
         erro =  fabs(Sx[nhj*funcao.nvars+k] - Sx[i*funcao.nvars+k]);  // Erro absoluto
@@ -478,7 +543,7 @@ void classify(int *H, float *Sfx, float *Sx, int *nh, int ns, float tol_same){
           break;
         }
       }
-
+      
       // Se todos os argumentos são os mesmos, então o conjunto de solução é o mesma
       if (same){
         novaclasse = false;
@@ -513,7 +578,7 @@ void classify(int *H, float *Sfx, float *Sx, int *nh, int ns, float tol_same){
 /* Inicialização de semente randômica
  */
 void randomize() {
-  srand((unsigned int) time(NULL));
+  srand((unsigned int) time(NULL)*(my_rank+1));
 }
 
 /* Geração dos números randômicos em PF dentro da faixa [low, high]
@@ -745,13 +810,15 @@ void Finnish(){
 }
 
 /*------------------------------------------------------------------*/
-/* abortexec - Aborta a execucao,
+/* abortexecMPI - Aborta a execucao do programa paralelo,
        emitindo uma mensagem e retornado o codigo de erro
+   @rank - Numero de rank
    @msg  - Mensagem de erro
    @ret  - Codigo de erro
 */
-void abortexec(char *msg, int ret){
-  printf("- MSG_ABORT_ERROR(%d): %s\n", ret, msg);
+void abortexecMPI(int rank, char *msg, int ret){
+  printf("[%d] - MSG_ABORT_ERROR(%d): %s\n", rank, ret, msg);
+  MPI_Abort(MPI_COMM_WORLD, ret);
 }
 
 
